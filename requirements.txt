@@ -1,4 +1,3 @@
 playwright==1.41.0
 supabase
-google-generativeai>=0.7.0
-asyncio
+google-genai
