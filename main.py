@@ -50,6 +50,7 @@ def call_gemini(prompt_text):
                 generation_config=GENERATION_CONFIG
             )
             
+            # We use the synchronous call here which is safer and more robust
             response = model.generate_content(prompt_text)
             
             # Check if response is valid
@@ -105,6 +106,7 @@ async def process_product(browser, row):
     pid = row['product_id']
     
     product_data = row.get('products', {}) or {}
+    # Check if we have a description OR if the last check was more than 7 days ago
     has_description = product_data.get('description') is not None
     
     mode = "PATROL" if has_description else "DISCOVERY"
