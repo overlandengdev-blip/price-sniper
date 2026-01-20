@@ -16,7 +16,6 @@ if not all([SUPABASE_URL, SUPABASE_KEY, GEMINI_API_KEY]):
     print("Error: Missing API Keys in Secrets.")
     exit(1)
 
-# --- SETUP SUPABASE ---
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 USER_AGENTS = [
@@ -24,16 +23,56 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
 ]
 
-def get_price_from_gemini_direct(text_content):
+def find_working_model():
     """
-    Sends raw HTTP request to Google Gemini API (v1 Stable).
-    Bypasses all library version conflicts.
+    Asks Google API which models are actually available for this API Key
+    and picks the best one automatically.
     """
-    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    print("🔍 Auto-detecting available AI models...")
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
+        response = requests.get(url)
+        
+        if response.status_code != 200:
+            print(f"⚠️ Could not list models. Status: {response.status_code}")
+            print(f"Response: {response.text}")
+            return "models/gemini-pro" # Fallback
+
+        data = response.json()
+        models = data.get('models', [])
+        
+        # Priority list: Try to find these in order
+        preferences = [
+            "gemini-1.5-flash",
+            "gemini-1.5-pro",
+            "gemini-1.0-pro",
+            "gemini-pro"
+        ]
+        
+        for pref in preferences:
+            for m in models:
+                if pref in m['name']:
+                    print(f"✅ Selected Model: {m['name']}")
+                    return m['name']
+        
+        # If none match, take the first available generative model
+        if models:
+            fallback = models[0]['name']
+            print(f"⚠️ No preferred model found. Using fallback: {fallback}")
+            return fallback
+            
+    except Exception as e:
+        print(f"⚠️ Model detection failed: {e}")
     
+    return "models/gemini-pro" # Ultimate fallback
+
+# Get the model ONCE at startup
+CURRENT_MODEL = find_working_model()
+
+def get_price_from_gemini_direct(text_content):
+    url = f"https://generativelanguage.googleapis.com/v1beta/{CURRENT_MODEL}:generateContent?key={GEMINI_API_KEY}"
     headers = {'Content-Type': 'application/json'}
     
-    # Prompt engineering
     payload = {
         "contents": [{
             "parts": [{
@@ -53,16 +92,14 @@ def get_price_from_gemini_direct(text_content):
         
         if response.status_code == 200:
             data = response.json()
-            # Extract text from complex JSON structure
             try:
                 answer = data['candidates'][0]['content']['parts'][0]['text']
-                # Clean up the answer to get just the number
                 price_str = answer.strip().replace('$', '').replace(',', '')
                 match = re.search(r"(\d+\.?\d*)", price_str)
                 if match:
                     return float(match.group(1))
             except (KeyError, IndexError):
-                print("AI returned unexpected format.")
+                print(f"AI Response Format Error: {data}")
         else:
             print(f"API Error {response.status_code}: {response.text}")
             
@@ -80,19 +117,15 @@ async def process_product(browser, row):
         await asyncio.sleep(5)
         
         body_text = await page.inner_text('body')
-        
-        # Use the new Direct Function
         price = get_price_from_gemini_direct(body_text)
         
         if price > 0:
             print(f"Found Price: ${price}")
-            # Update Database
             supabase.table("products").update({"price": price}).eq("id", row['product_id']).execute()
             supabase.table("product_sources").update({
                 "last_price": price, 
                 "last_checked": "now()"
             }).eq("id", row['id']).execute()
-            # Log History
             supabase.table("price_history").insert({
                 "product_id": row['product_id'], 
                 "price": price
