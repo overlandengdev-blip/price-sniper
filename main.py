@@ -4,7 +4,7 @@ import random
 import re
 from playwright.async_api import async_playwright
 from supabase import create_client, Client
-from google import genai
+from google import genai  # <--- NEW LIBRARY IMPORT
 
 # --- CONFIGURATION ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -36,7 +36,7 @@ async def get_price_from_gemini(text_content):
             f"TEXT CONTENT:\n{text_content[:8000]}"
         )
         
-        # New syntax for generating content
+        # NEW CODE SYNTAX FOR GEMINI 1.5
         response = ai_client.models.generate_content(
             model='gemini-1.5-flash',
             contents=prompt
