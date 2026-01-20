@@ -1,9 +1,9 @@
 name: Daily Price Patrol
 
 on:
+  workflow_dispatch:      # Allows manual click (keep this!)
   schedule:
-    - cron: '0 3 * * *'  # Runs at 03:00 UTC every day
-  workflow_dispatch:      # Allows you to click "Run Now" manually
+    - cron: '*/30 * * * *' # Runs every 30 minutes automatically
 
 jobs:
   scrape:
