@@ -1,4 +1,4 @@
 playwright==1.41.0
 supabase
-google-generativeai==0.3.2
+google-generativeai>=0.7.0
 asyncio
