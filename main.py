@@ -4,10 +4,9 @@ import random
 import re
 import time
 import json
+import requests
 from playwright.async_api import async_playwright
 from supabase import create_client, Client
-from google import genai
-from google.genai import types
 
 # --- CONFIGURATION ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -18,68 +17,91 @@ if not all([SUPABASE_URL, SUPABASE_KEY, GEMINI_API_KEY]):
     print("❌ Error: Missing API Keys in Secrets.")
     exit(1)
 
-# Initialize Clients
+# Initialize Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-client = genai.Client(api_key=GEMINI_API_KEY)
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
 ]
 
-# --- NEW GEMINI CLIENT FUNCTION ---
+# --- DIRECT API HELPERS (NO SDK) ---
 
-def call_gemini(prompt_text):
-    """Uses the NEW google-genai SDK to call Gemini."""
-    # Priority list: Try standard Flash first, then Pro if needed
-    models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro"]
+def call_gemini_raw(prompt_payload):
+    """
+    Directly hits the Gemini API via HTTP Request.
+    Bypasses SDK versioning issues by trying known stable endpoints.
+    """
+    headers = {'Content-Type': 'application/json'}
     
-    for model_name in models_to_try:
+    # 1. Define the endpoints we want to try (Stable v1 first, then v1beta)
+    # We use explicit model names for each endpoint.
+    endpoints = [
+        # Strategy A: Gemini 1.5 Flash on Stable v1 (Best)
+        f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+        # Strategy B: Gemini 1.5 Flash on Beta (Fallback)
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+        # Strategy C: Gemini Pro (Old Reliable)
+        f"https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent?key={GEMINI_API_KEY}"
+    ]
+
+    for url in endpoints:
         try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt_text,
-                config=types.GenerateContentConfig(
-                    temperature=0.5,
-                    top_p=0.95,
-                    top_k=64,
-                    max_output_tokens=8192,
-                    response_mime_type="application/json",
-                )
-            )
+            print(f"   🤖 Sending request to: ...{url.split('models/')[1].split(':')[0]}...")
+            response = requests.post(url, headers=headers, json=prompt_payload, timeout=30)
             
-            if response.text:
-                return response.text
+            if response.status_code == 200:
+                return response.json()
+            
+            # If 404, the model/version combo is wrong. Try next.
+            # If 429, we are rate limited. Sleep and retry (or skip).
+            elif response.status_code == 429:
+                print("   ⏳ Rate Limit. Sleeping 5s...")
+                time.sleep(5)
+                continue
+            else:
+                print(f"   ⚠️ API Error {response.status_code}: {response.text[:100]}")
                 
         except Exception as e:
-            print(f"   ⚠️ Error with {model_name}: {e}")
+            print(f"   ❌ Connection Error: {e}")
             time.sleep(1)
-            continue
             
-    print("   ❌ All AI models failed. Please check API Key permissions.")
+    print("   ❌ All API endpoints failed.")
     return None
 
 # --- PROMPTS ---
 
-def get_full_analysis_prompt(text):
-    return (
-        f"Analyze this product page text and extract detailed data. "
-        f"Return ONLY a raw JSON object with these keys:\n"
-        f"- 'price': (float) The current price (0 if not found).\n"
-        f"- 'description': (string) A short, punchy marketing summary (max 200 chars).\n"
-        f"- 'weight': (string) The weight if found (e.g. '25kg'), else 'N/A'.\n"
-        f"- 'compatibility': (string) Vehicle fitment details (e.g. 'Fits Ford Ranger 2012+'), else 'Universal'.\n"
-        f"- 'specs': (object) A dictionary of other key specs found.\n\n"
-        f"TEXT CONTENT:\n{text[:15000]}"
-    )
+def get_full_analysis_payload(text):
+    return {
+        "contents": [{
+            "parts": [{
+                "text": (
+                    f"Analyze this product page text and extract detailed data. "
+                    f"Return ONLY a raw JSON object (no markdown) with these keys:\n"
+                    f"- 'price': (float) The current price (0 if not found).\n"
+                    f"- 'description': (string) A short, punchy marketing summary (max 200 chars).\n"
+                    f"- 'weight': (string) The weight if found (e.g. '25kg'), else 'N/A'.\n"
+                    f"- 'compatibility': (string) Vehicle fitment details, else 'Universal'.\n"
+                    f"- 'specs': (object) A dictionary of other key specs found.\n\n"
+                    f"TEXT CONTENT:\n{text[:15000]}"
+                )
+            }]
+        }]
+    }
 
-def get_price_only_prompt(text):
-    return (
-        f"Find the price. Return a JSON object with one key: 'price' (float). "
-        f"Ignore currency symbols. If multiple prices exist, use the lowest sale price. "
-        f"If no price is found, return 0.\n"
-        f"TEXT:\n{text[:8000]}"
-    )
+def get_price_only_payload(text):
+    return {
+        "contents": [{
+            "parts": [{
+                "text": (
+                    f"Find the price. Return a JSON object with one key: 'price' (float). "
+                    f"Ignore currency. If multiple, use lowest sale price. "
+                    f"If no price is found, return 0.\n"
+                    f"TEXT:\n{text[:8000]}"
+                )
+            }]
+        }]
+    }
 
 # --- CORE LOGIC ---
 
@@ -97,6 +119,7 @@ async def process_product(browser, row):
     pid = row['product_id']
     
     product_data = row.get('products', {}) or {}
+    # Discovery mode if description is missing
     has_description = product_data.get('description') is not None
     
     mode = "PATROL" if has_description else "DISCOVERY"
@@ -116,12 +139,13 @@ async def process_product(browser, row):
             img_url = await get_image(page)
             if img_url: update_data['image_url'] = img_url
 
-            # Call AI
-            json_text = call_gemini(get_full_analysis_prompt(body_text))
+            # Call AI (Raw)
+            resp = call_gemini_raw(get_full_analysis_payload(body_text))
             
-            if json_text:
+            if resp and 'candidates' in resp:
                 try:
-                    clean_json = json_text.replace('```json', '').replace('```', '').strip()
+                    raw_text = resp['candidates'][0]['content']['parts'][0]['text']
+                    clean_json = raw_text.replace('```json', '').replace('```', '').strip()
                     data = json.loads(clean_json)
                     
                     current_price = float(data.get('price', 0))
@@ -136,14 +160,17 @@ async def process_product(browser, row):
                     print(f"   🧠 AI Success: Price ${current_price} | {data.get('description')[:30]}...")
                 except Exception as e:
                     print(f"   ⚠️ JSON Parse Error: {e}")
+            else:
+                 print("   ⚠️ No valid AI response.")
 
         else:
             print("   ⚡ Known Product. Checking Price only...")
-            json_text = call_gemini(get_price_only_prompt(body_text))
+            resp = call_gemini_raw(get_price_only_payload(body_text))
             
-            if json_text:
+            if resp and 'candidates' in resp:
                 try:
-                    clean_json = json_text.replace('```json', '').replace('```', '').strip()
+                    raw_text = resp['candidates'][0]['content']['parts'][0]['text']
+                    clean_json = raw_text.replace('```json', '').replace('```', '').strip()
                     data = json.loads(clean_json)
                     current_price = float(data.get('price', 0))
                     if current_price > 0:
