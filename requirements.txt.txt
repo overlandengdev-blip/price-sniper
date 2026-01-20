@@ -1,0 +1,4 @@
+playwright==1.41.0
+supabase==2.3.0
+google-generativeai==0.3.2
+asyncio
