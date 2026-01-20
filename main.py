@@ -3,10 +3,11 @@ import os
 import random
 import re
 import time
-import requests
 import json
 from playwright.async_api import async_playwright
 from supabase import create_client, Client
+import google.generativeai as genai
+from google.api_core import exceptions as google_exceptions
 
 # --- CONFIGURATION ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -17,79 +18,78 @@ if not all([SUPABASE_URL, SUPABASE_KEY, GEMINI_API_KEY]):
     print("❌ Error: Missing API Keys in Secrets.")
     exit(1)
 
+# Initialize Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
 
-# List of models to try in order of preference
-MODELS_TO_TRY = ["gemini-1.5-flash", "gemini-1.5-flash-latest", "gemini-pro"]
+# Configuration for Gemini
+GENERATION_CONFIG = {
+    "temperature": 0.5,
+    "top_p": 0.95,
+    "top_k": 64,
+    "max_output_tokens": 8192,
+    "response_mime_type": "application/json",
+}
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
 ]
 
-# --- GEMINI AI HELPERS (With Fallback) ---
+# --- GEMINI AI FUNCTION (OFFICIAL LIBRARY) ---
 
-def call_gemini(payload):
-    """Sends a request to Google Gemini API with model fallback."""
-    headers = {'Content-Type': 'application/json'}
+def call_gemini(prompt_text):
+    """Uses the official Google Library to call Gemini with fallback models."""
+    # List of models to try (Newest to Oldest)
+    models_to_try = ["gemini-1.5-flash", "gemini-1.5-flash-latest", "gemini-pro"]
     
-    for model in MODELS_TO_TRY:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-        
-        for attempt in range(2): # Try each model twice
-            try:
-                response = requests.post(url, headers=headers, data=json.dumps(payload))
+    for model_name in models_to_try:
+        try:
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config=GENERATION_CONFIG
+            )
+            
+            response = model.generate_content(prompt_text)
+            
+            # Check if response is valid
+            if response.text:
+                return response.text
                 
-                if response.status_code == 200:
-                    return response.json()
-                elif response.status_code == 429:
-                    print(f"   ⏳ Rate Limit on {model}. Sleeping 5s...")
-                    time.sleep(5)
-                elif response.status_code == 404:
-                    print(f"   ⚠️ Model {model} not found. Switching to backup...")
-                    break # Break inner loop to try next model
-                else:
-                    print(f"   ⚠️ API Error {response.status_code} on {model}")
-                    break
-            except Exception as e:
-                print(f"   ❌ Connection Error: {e}")
-                time.sleep(2)
-    
+        except google_exceptions.NotFound:
+            print(f"   ⚠️ Model '{model_name}' not found. Trying next...")
+            continue
+        except Exception as e:
+            print(f"   ⚠️ Error with {model_name}: {e}")
+            time.sleep(2)
+            continue
+            
     print("   ❌ All AI models failed.")
     return None
 
+# --- PROMPTS ---
+
 def get_full_analysis_prompt(text):
-    return {
-        "contents": [{
-            "parts": [{
-                "text": (
-                    f"Analyze this product page text and extract detailed data. "
-                    f"Return ONLY a raw JSON object (no markdown formatting) with these keys:\n"
-                    f"- 'price': (float) The current price.\n"
-                    f"- 'description': (string) A short, punchy marketing summary (max 200 chars).\n"
-                    f"- 'weight': (string) The weight if found (e.g. '25kg'), else 'N/A'.\n"
-                    f"- 'compatibility': (string) Vehicle fitment details (e.g. 'Fits Ford Ranger 2012+'), else 'Universal'.\n"
-                    f"- 'specs': (object) A dictionary of other key specs found.\n\n"
-                    f"TEXT CONTENT:\n{text[:12000]}"
-                )
-            }]
-        }]
-    }
+    return (
+        f"Analyze this product page text and extract detailed data. "
+        f"Return ONLY a raw JSON object with these keys:\n"
+        f"- 'price': (float) The current price (0 if not found).\n"
+        f"- 'description': (string) A short, punchy marketing summary (max 200 chars).\n"
+        f"- 'weight': (string) The weight if found (e.g. '25kg'), else 'N/A'.\n"
+        f"- 'compatibility': (string) Vehicle fitment details (e.g. 'Fits Ford Ranger 2012+'), else 'Universal'.\n"
+        f"- 'specs': (object) A dictionary of other key specs found.\n\n"
+        f"TEXT CONTENT:\n{text[:15000]}"
+    )
 
 def get_price_only_prompt(text):
-    return {
-        "contents": [{
-            "parts": [{
-                "text": (
-                    f"Find the price. Return ONLY the number as a float (e.g. 2450.00). "
-                    f"Ignore currency. If multiple, use lowest sale price.\n"
-                    f"TEXT:\n{text[:6000]}"
-                )
-            }]
-        }]
-    }
+    return (
+        f"Find the price. Return a JSON object with one key: 'price' (float). "
+        f"Ignore currency symbols. If multiple prices exist, use the lowest sale price. "
+        f"If no price is found, return 0.\n"
+        f"TEXT:\n{text[:8000]}"
+    )
 
-# --- SCRAPING HELPERS ---
+# --- CORE LOGIC ---
 
 async def get_image(page):
     try:
@@ -99,8 +99,6 @@ async def get_image(page):
         return img
     except:
         return None
-
-# --- CORE LOGIC ---
 
 async def process_product(browser, row):
     url = row['url']
@@ -123,81 +121,70 @@ async def process_product(browser, row):
 
         if mode == "DISCOVERY":
             print("   🚀 New Product! Grabbing Image & Details...")
-            
             img_url = await get_image(page)
-            if img_url: 
-                update_data['image_url'] = img_url
+            if img_url: update_data['image_url'] = img_url
 
-            resp = call_gemini(get_full_analysis_prompt(body_text))
+            # Call AI
+            json_text = call_gemini(get_full_analysis_prompt(body_text))
             
-            if resp: # CRASH FIX: Only proceed if we got a response
+            if json_text:
                 try:
-                    candidates = resp.get('candidates', [])
-                    if candidates:
-                        raw_text = candidates[0]['content']['parts'][0]['text']
-                        clean_json = raw_text.replace('```json', '').replace('```', '').strip()
-                        data = json.loads(clean_json)
-                        
-                        current_price = float(data.get('price', 0))
-                        update_data.update({
-                            "price": current_price,
-                            "description": data.get('description'),
-                            "weight": data.get('weight'),
-                            "compatibility": data.get('compatibility'),
-                            "specs": data.get('specs'),
-                            "is_approved": False
-                        })
-                        print(f"   🧠 AI Analysis Success: ${current_price}")
-                    else:
-                        print("   ⚠️ AI returned no candidates.")
+                    # Clean markdown if present (e.g., ```json ... ```)
+                    clean_json = json_text.replace('```json', '').replace('```', '').strip()
+                    data = json.loads(clean_json)
+                    
+                    current_price = float(data.get('price', 0))
+                    update_data.update({
+                        "price": current_price,
+                        "description": data.get('description'),
+                        "weight": data.get('weight'),
+                        "compatibility": data.get('compatibility'),
+                        "specs": data.get('specs'),
+                        "is_approved": False
+                    })
+                    print(f"   🧠 AI Success: Price ${current_price} | {data.get('description')[:30]}...")
                 except Exception as e:
-                    print(f"   ⚠️ AI Parsing Failed: {e}")
+                    print(f"   ⚠️ JSON Parse Error: {e}")
 
         else:
             print("   ⚡ Known Product. Checking Price only...")
-            resp = call_gemini(get_price_only_prompt(body_text))
+            json_text = call_gemini(get_price_only_prompt(body_text))
             
-            if resp:
+            if json_text:
                 try:
-                    candidates = resp.get('candidates', [])
-                    if candidates:
-                        text = candidates[0]['content']['parts'][0]['text']
-                        clean_price = text.strip().replace('$', '').replace(',', '')
-                        match = re.search(r"(\d+\.?\d*)", clean_price)
-                        if match: 
-                            current_price = float(match.group(1))
-                            update_data["price"] = current_price
+                    clean_json = json_text.replace('```json', '').replace('```', '').strip()
+                    data = json.loads(clean_json)
+                    current_price = float(data.get('price', 0))
+                    if current_price > 0:
+                        update_data["price"] = current_price
                 except:
-                    print("   ⚠️ Could not parse price.")
+                    print("   ⚠️ Could not parse price JSON.")
 
-        # --- SAVE TO DATABASE ---
+        # SAVE TO DB
         if current_price > 0:
             print(f"   💰 Saving Price: ${current_price}")
-            
             supabase.table("products").update(update_data).eq("id", pid).execute()
-            
             supabase.table("product_sources").update({
-                "last_price": current_price,
+                "last_price": current_price, 
                 "last_checked": "now()"
             }).eq("id", row['id']).execute()
-            
             supabase.table("price_history").insert({
-                "product_id": pid,
+                "product_id": pid, 
                 "price": current_price
             }).execute()
         
         await page.close()
 
     except Exception as e:
-        print(f"   ❌ Failed to process URL: {e}")
+        print(f"   ❌ Failed: {e}")
 
 async def main():
-    print("📡 Fetching patrol list from Supabase...")
+    print("📡 Fetching patrol list...")
     response = supabase.table("product_sources").select("*, products(*)").execute()
     sources = response.data
     
     if not sources:
-        print("💤 No products to track.")
+        print("💤 No products.")
         return
 
     print(f"🔥 Starting patrol for {len(sources)} products...")
