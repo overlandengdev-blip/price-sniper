@@ -6,8 +6,8 @@ import time
 import json
 from playwright.async_api import async_playwright
 from supabase import create_client, Client
-import google.generativeai as genai
-from google.api_core import exceptions as google_exceptions
+from google import genai
+from google.genai import types
 
 # --- CONFIGURATION ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -20,52 +20,43 @@ if not all([SUPABASE_URL, SUPABASE_KEY, GEMINI_API_KEY]):
 
 # Initialize Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-genai.configure(api_key=GEMINI_API_KEY)
-
-# Configuration for Gemini
-GENERATION_CONFIG = {
-    "temperature": 0.5,
-    "top_p": 0.95,
-    "top_k": 64,
-    "max_output_tokens": 8192,
-    "response_mime_type": "application/json",
-}
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
 ]
 
-# --- GEMINI AI FUNCTION (OFFICIAL LIBRARY) ---
+# --- NEW GEMINI CLIENT FUNCTION ---
 
 def call_gemini(prompt_text):
-    """Uses the official Google Library to call Gemini with fallback models."""
-    # List of models to try (Newest to Oldest)
-    models_to_try = ["gemini-1.5-flash", "gemini-1.5-flash-latest", "gemini-pro"]
+    """Uses the NEW google-genai SDK to call Gemini."""
+    # Priority list: Try standard Flash first, then Pro if needed
+    models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro"]
     
     for model_name in models_to_try:
         try:
-            model = genai.GenerativeModel(
-                model_name=model_name,
-                generation_config=GENERATION_CONFIG
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt_text,
+                config=types.GenerateContentConfig(
+                    temperature=0.5,
+                    top_p=0.95,
+                    top_k=64,
+                    max_output_tokens=8192,
+                    response_mime_type="application/json",
+                )
             )
             
-            # We use the synchronous call here which is safer and more robust
-            response = model.generate_content(prompt_text)
-            
-            # Check if response is valid
             if response.text:
                 return response.text
                 
-        except google_exceptions.NotFound:
-            print(f"   ⚠️ Model '{model_name}' not found. Trying next...")
-            continue
         except Exception as e:
             print(f"   ⚠️ Error with {model_name}: {e}")
-            time.sleep(2)
+            time.sleep(1)
             continue
             
-    print("   ❌ All AI models failed.")
+    print("   ❌ All AI models failed. Please check API Key permissions.")
     return None
 
 # --- PROMPTS ---
@@ -106,7 +97,6 @@ async def process_product(browser, row):
     pid = row['product_id']
     
     product_data = row.get('products', {}) or {}
-    # Check if we have a description OR if the last check was more than 7 days ago
     has_description = product_data.get('description') is not None
     
     mode = "PATROL" if has_description else "DISCOVERY"
@@ -131,7 +121,6 @@ async def process_product(browser, row):
             
             if json_text:
                 try:
-                    # Clean markdown if present (e.g., ```json ... ```)
                     clean_json = json_text.replace('```json', '').replace('```', '').strip()
                     data = json.loads(clean_json)
                     
