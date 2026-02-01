@@ -634,7 +634,10 @@ def extract_prices(soup: BeautifulSoup, body_text: str, json_data: Dict) -> Tupl
 
     # --- PRICE VERDICT ---
     if not candidates:
+        logger.warning("   No price candidates found from any source")
         return None, None, None
+
+    logger.info(f"   Found {len(candidates)} price candidates from sources: {set(c['src'].split('-')[0] for c in candidates)}")
 
     # Separate by type and score
     type_scores = {"regular": {}, "sale": {}, "current": {}}
@@ -903,9 +906,21 @@ async def process_product(sem: asyncio.Semaphore, browser, row: Dict, is_daily_u
             body_text = await page.inner_text("body")
             soup = BeautifulSoup(html, 'html.parser')
 
+            # Check if page content is valid
+            if len(body_text) < 100:
+                logger.warning(f"   WARNING: Page content very short ({len(body_text)} chars) - may be blocked or empty")
+            elif "access denied" in body_text.lower() or "captcha" in body_text.lower():
+                logger.warning(f"   WARNING: Page may be blocked (access denied/captcha detected)")
+
             # --- EXTRACTION ---
             specs = ProductSpecs()
             json_data = extract_json_ld(soup)
+
+            # Debug: Log what structured data we found
+            if json_data:
+                logger.info(f"   Found JSON-LD data: {list(json_data.keys())}")
+            else:
+                logger.warning(f"   WARNING: No JSON-LD structured data found on page")
 
             # Name
             specs.name = json_data.get('name')
@@ -1051,6 +1066,11 @@ async def process_product(sem: asyncio.Semaphore, browser, row: Dict, is_daily_u
                     update_data["sku"] = specs.sku
                 if specs.brand:
                     update_data["brand"] = specs.brand
+
+            # Log what we're about to save
+            logger.info(f"   Saving to DB: {list(update_data.keys())}")
+            if 'price' not in update_data:
+                logger.warning(f"   WARNING: No price being saved for product {pid}")
 
             supabase.table("products").update(update_data).eq("id", pid).execute()
 
