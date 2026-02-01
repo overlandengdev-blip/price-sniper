@@ -915,8 +915,16 @@ async def process_product(sem: asyncio.Semaphore, browser, row: Dict, is_daily_u
             if not specs.name and soup.title:
                 specs.name = soup.title.string
 
+            # Log warning if no name found
+            if not specs.name:
+                logger.warning(f"   WARNING: No product name found for {url}")
+
             # Prices (ALWAYS extract for daily updates)
             specs.regular_price, specs.sale_price, specs.current_price = extract_prices(soup, body_text, json_data)
+
+            # Log warning if no price found
+            if not specs.current_price and not specs.regular_price and not specs.sale_price:
+                logger.warning(f"   WARNING: No price found for {url}")
 
             # Availability (ALWAYS extract for daily updates)
             specs.availability = extract_availability(soup, body_text, json_data)
@@ -997,22 +1005,22 @@ async def process_product(sem: asyncio.Semaphore, browser, row: Dict, is_daily_u
                 }
                 if specs.current_price:
                     update_data["price"] = specs.current_price
-                    if specs.regular_price:
-                        update_data["regular_price"] = specs.regular_price
-                    if specs.sale_price:
-                        update_data["sale_price"] = specs.sale_price
-                update_data["availability"] = specs.availability
+                if specs.regular_price:
+                    update_data["regular_price"] = specs.regular_price
+                if specs.sale_price:
+                    update_data["sale_price"] = specs.sale_price
+                update_data["availability"] = specs.availability if specs.availability else "unknown"
 
                 logger.info(f"   Daily update: price=${specs.current_price}, availability={specs.availability}")
             else:
                 # Full update
                 update_data = {
                     "name": (specs.name or "Unknown")[:255],
-                    "description": specs.description,
-                    "category": specs.category,
+                    "description": specs.description if specs.description else "Description unavailable.",
+                    "category": specs.category if specs.category else "Uncategorized",
                     "updated_at": now,
                     "last_full_scrape": now,
-                    "availability": specs.availability
+                    "availability": specs.availability if specs.availability else "unknown"
                 }
 
                 if specs.image_url:
@@ -1063,6 +1071,19 @@ async def process_product(sem: asyncio.Semaphore, browser, row: Dict, is_daily_u
 
         except Exception as e:
             logger.error(f"   Scrape error: {e}")
+            # Update product with error info so it doesn't stay as "Scanning..."
+            try:
+                error_update = {
+                    "updated_at": datetime.now().isoformat(),
+                    "availability": "unknown"
+                }
+                # Only update name if it's still "Scanning..." (new product)
+                if product_data.get('name') == "Scanning..." or not product_data.get('name'):
+                    error_update["name"] = f"Error: {str(e)[:200]}"
+                    error_update["description"] = f"Failed to extract product data from {url}. Error: {str(e)}"
+                supabase.table("products").update(error_update).eq("id", pid).execute()
+            except Exception as db_error:
+                logger.error(f"   Failed to update error state: {db_error}")
 
 
 async def main():
