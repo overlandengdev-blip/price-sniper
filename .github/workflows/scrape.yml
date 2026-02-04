@@ -1,4 +1,4 @@
-name: Product Specification Extractor
+name: Product Specification Extractor v3
 
 on:
   workflow_dispatch:
@@ -11,14 +11,20 @@ on:
         options:
           - full
           - daily
+      url:
+        description: 'Single URL to process (optional)'
+        required: false
+        type: string
   schedule:
-    # Daily price/availability update - runs every 6 hours
-    - cron: '0 */6 * * *'
+    # Daily price/availability update - runs every 4 hours
+    - cron: '0 */4 * * *'
+    # Weekly full re-scrape on Sunday at 3 AM UTC
+    - cron: '0 3 * * 0'
 
 jobs:
   extract:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout Code
@@ -35,21 +41,41 @@ jobs:
           pip install -r requirements.txt
           playwright install chromium
 
-      - name: Run Product Extractor (Daily Mode - Scheduled)
-        if: github.event_name == 'schedule'
+      - name: Run Product Extractor (Daily - Scheduled)
+        if: github.event_name == 'schedule' && github.event.schedule == '0 */4 * * *'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           DAILY_UPDATE: 'true'
         run: python main.py --daily
 
-      - name: Run Product Extractor (Manual Mode)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Run Product Extractor (Weekly Full Scrape)
+        if: github.event_name == 'schedule' && github.event.schedule == '0 3 * * 0'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: python main.py
+
+      - name: Run Product Extractor (Manual - Single URL)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.url != ''
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: python main.py --url="${{ github.event.inputs.url }}"
+
+      - name: Run Product Extractor (Manual - All Products)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.url == ''
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           DAILY_UPDATE: ${{ github.event.inputs.mode == 'daily' && 'true' || 'false' }}
         run: |
           if [ "${{ github.event.inputs.mode }}" = "daily" ]; then
@@ -57,31 +83,3 @@ jobs:
           else
             python main.py
           fi
-
-  # Weekly full re-scrape to catch any spec changes
-  full-rescrape:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    if: github.event_name == 'schedule' && github.event.schedule == '0 3 * * 0'
-
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install Dependencies
-        run: |
-          pip install -r requirements.txt
-          playwright install chromium
-
-      - name: Run Full Extraction
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python main.py
